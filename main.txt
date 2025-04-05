@@ -1,0 +1,588 @@
+from typing import Dict, List, Any, Optional, Tuple
+import json
+import streamlit as st
+import pandas as pd
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage, BaseMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.runnables import RunnablePassthrough
+from langgraph.graph import StateGraph, START, END
+from sentence_transformers import SentenceTransformer
+from numpy import dot
+from numpy.linalg import norm
+import hashlib
+import uuid
+
+
+# Define the state type for the graph
+class QuestionState(BaseModel):
+    """State for the question decomposition graph."""
+    question: str = Field(...,
+                          description="The current question being processed")
+    answer: Optional[str] = Field(
+        None, description="The final answer to the question")
+    sub_questions: List[str] = Field(
+        default_factory=list, description="List of sub-questions generated")
+    sub_answers: List[Dict] = Field(
+        default_factory=list, description="Answers to sub-questions")
+    depth: int = Field(0, description="Current depth in the recursion")
+    question_path: List[str] = Field(
+        default_factory=list, description="Path of questions to detect loops")
+    question_hash: str = Field(
+        "", description="Hash of the current question for caching")
+    decision: str = Field(
+        "", description="Decision to break down or answer directly")
+    llm_type: str = Field("", description="Type of LLM to use for answering")
+    node_id: str = Field(
+        "", description="Unique identifier for this node in the tree")
+    parent_id: Optional[str] = Field(None, description="Parent node ID")
+    max_depth: int = Field(5, description="Maximum recursion depth")
+    tree_data: Dict[str, Any] = Field(default_factory=dict,
+                                      description="Data structure to visualize the tree")
+
+
+# Output schemas for different steps
+class BreakdownDecision(BaseModel):
+    """Decision whether to break down a question or answer directly."""
+    decision: str = Field(...,
+                          description="Either 'break down' or 'answer directly'")
+    reasoning: str = Field(..., description="Reasoning for this decision")
+
+
+class SubQuestion(BaseModel):
+    """A sub-question generated from a parent question."""
+    question: str = Field(..., description="The sub-question text")
+    llm_type: str = Field(...,
+                          description="Type of LLM to use: factual, reasoning, or creative")
+    reasoning: str = Field(...,
+                           description="Why this sub-question is relevant")
+
+
+class SubQuestionList(BaseModel):
+    """List of sub-questions."""
+    sub_questions: List[SubQuestion] = Field(...,
+                                             description="List of sub-questions")
+
+
+class CacheManager:
+    """Manages semantic caching of questions and answers."""
+
+    def __init__(self):
+        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        # Initialize cache if not already in session
+        if "semantic_cache" not in st.session_state:
+            st.session_state.semantic_cache = []
+
+    def get_embedding(self, text: str):
+        """Generate embedding for a text."""
+        return self.embedder.encode(text)
+
+    def get_hash(self, text: str) -> str:
+        """Generate a simple hash for a question."""
+        return hashlib.md5(text.encode()).hexdigest()
+
+    def find_cached_answer(self, question: str) -> Optional[str]:
+        """Find a cached answer based on semantic similarity."""
+        new_embedding = self.get_embedding(question)
+        question_hash = self.get_hash(question)
+
+        # First try exact hash match
+        for entry in st.session_state.semantic_cache:
+            if entry.get("hash") == question_hash:
+                return entry.get("answer")
+
+        # Then try semantic similarity
+        for entry in st.session_state.semantic_cache:
+            emb = entry.get("embedding")
+            similarity = dot(emb, new_embedding) / \
+                (norm(emb) * norm(new_embedding))
+            if similarity > 0.92:  # Slightly higher threshold for better precision
+                return entry.get("answer")
+
+        return None
+
+    def add_to_cache(self, question: str, answer: str):
+        """Add a question-answer pair to the cache."""
+        entry = {
+            "hash": self.get_hash(question),
+            "question": question,
+            "answer": answer,
+            "embedding": self.get_embedding(question)
+        }
+        st.session_state.semantic_cache.append(entry)
+
+
+class LLMService:
+    """Manages connections to different LLM services."""
+
+    def __init__(self, base_url="http://localhost:1234/v1"):
+        self.base_url = base_url
+        self.llm_map = self._initialize_llms()
+
+    def _initialize_llms(self):
+        """Initialize different LLM configurations."""
+        factual_llm = ChatOpenAI(
+            openai_api_base=self.base_url,
+            model_name="deepseek-r1-distill-qwen-7b",
+            temperature=0.2,  # Lower temperature for factual queries
+            max_tokens=500,
+            api_key="lmstudio-no-key-needed",
+            default_headers={"Content-Type": "application/json"}
+        )
+
+        reasoning_llm = ChatOpenAI(
+            openai_api_base=self.base_url,
+            model_name="deepseek-r1-distill-qwen-7b",
+            temperature=0.5,  # Moderate temperature for reasoning
+            max_tokens=800,  # More tokens for complex reasoning
+            api_key="lmstudio-no-key-needed",
+            default_headers={"Content-Type": "application/json"}
+        )
+
+        creative_llm = ChatOpenAI(
+            openai_api_base=self.base_url,
+            model_name="deepseek-r1-distill-qwen-7b",
+            temperature=0.8,  # Higher temperature for creative tasks
+            max_tokens=1000,  # More tokens for creative outputs
+            api_key="lmstudio-no-key-needed",
+            default_headers={"Content-Type": "application/json"}
+        )
+
+        # Orchestrator with more reasoning capabilities
+        orchestrator_llm = ChatOpenAI(
+            openai_api_base=self.base_url,
+            model_name="deepseek-r1-distill-qwen-7b",
+            temperature=0.3,  # Lower temperature for consistent planning
+            max_tokens=1500,  # More tokens for planning
+            api_key="lmstudio-no-key-needed",
+            default_headers={"Content-Type": "application/json"}
+        )
+
+        return {
+            "factual": factual_llm,
+            "reasoning": reasoning_llm,
+            "creative": creative_llm,
+            "orchestrator": orchestrator_llm
+        }
+
+    def get_llm(self, llm_type: str):
+        """Get the LLM for a specific type."""
+        return self.llm_map.get(llm_type, self.llm_map["orchestrator"])
+
+    def classify_question_type(self, question: str) -> str:
+        """Determine the best LLM type for a question."""
+        # A more sophisticated version would use the orchestrator LLM
+        # to determine the best approach
+
+        question_lower = question.lower()
+
+        # Simple heuristic classification
+        if any(word in question_lower for word in ["what", "who", "when", "where", "which", "list", "define", "identify"]):
+            return "factual"
+        elif any(word in question_lower for word in ["why", "how", "explain", "compare", "analyze", "evaluate"]):
+            return "reasoning"
+        elif any(word in question_lower for word in ["imagine", "create", "design", "suggest", "invent", "craft"]):
+            return "creative"
+        else:
+            # Use a more sophisticated approach for ambiguous cases
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """Classify the question into one of these categories:
+                1. factual - for straightforward factual information
+                2. reasoning - for questions requiring analysis or explanation
+                3. creative - for questions requiring imagination or idea generation
+                
+                Respond with ONLY the category name: factual, reasoning, or creative."""),
+                ("human", "{question}")
+            ])
+
+            chain = prompt | self.get_llm("orchestrator")
+            response = chain.invoke({"question": question})
+
+            response_text = response.content.strip().lower()
+            if "factual" in response_text:
+                return "factual"
+            elif "reasoning" in response_text:
+                return "reasoning"
+            else:
+                return "creative"
+
+
+def should_break_down(state: QuestionState) -> QuestionState:
+    """Decide whether to break down a question or answer directly."""
+    llm_service = LLMService()
+
+    # Check recursion limits
+    if state.depth >= state.max_depth:
+        state.decision = "answer directly"
+        state.llm_type = llm_service.classify_question_type(state.question)
+        return state
+
+    # Check if question is in the path (loop detection)
+    if state.question in state.question_path:
+        state.decision = "answer directly"
+        state.llm_type = llm_service.classify_question_type(state.question)
+        return state
+
+    # Use LLM to make the decision
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert at determining if a question needs to be broken down into sub-questions.
+        Consider the following:
+        1. Is the question complex and multifaceted?
+        2. Does it require gathering different types of information?
+        3. Would breaking it down improve the quality of the answer?
+        4. Is it already a simple, direct question?
+        
+        Output your decision in JSON format with these fields:
+        - decision: either "break down" or "answer directly"
+        - reasoning: your reasoning for this decision"""),
+        ("human", "Question: {question}")
+    ])
+
+    parser = JsonOutputParser(pydantic_object=BreakdownDecision)
+    chain = prompt | llm_service.get_llm("orchestrator") | parser
+
+    try:
+        result = chain.invoke({"question": state.question})
+        state.decision = result.get("decision", "answer directly")
+
+        # If undecided, determine based on complexity
+        if state.decision not in ["break down", "answer directly"] and isinstance(result, dict):
+            words = len(state.question.split())
+            state.decision = "break down" if words > 10 else "answer directly"
+
+        # If answering directly, classify the question type
+        if state.decision == "answer directly":
+            state.llm_type = llm_service.classify_question_type(state.question)
+    except Exception as e:
+        # Fallback in case of parsing errors
+        st.warning(f"Error in decision making: {str(e)}")
+        state.decision = "answer directly"
+        state.llm_type = "reasoning"
+
+    return state
+
+
+def generate_sub_questions(state: QuestionState) -> QuestionState:
+    """Generate sub-questions for a complex question."""
+    llm_service = LLMService()
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert at breaking down complex questions into smaller, more manageable sub-questions.
+        For the given question, create 2-5 sub-questions that, when answered together, would help address the original question comprehensively.
+        
+        For each sub-question:
+        1. Make it clear and specific
+        2. Ensure it's relevant to the original question
+        3. Classify it as one of: factual, reasoning, or creative
+        
+        Output in JSON format with these fields:
+        - sub_questions: list of objects, each with:
+          - question: the sub-question text
+          - llm_type: the type of LLM to use (factual, reasoning, or creative)
+          - reasoning: brief explanation of why this sub-question is relevant"""),
+        ("human", "Original question: {question}")
+    ])
+
+    parser = JsonOutputParser(pydantic_object=SubQuestionList)
+    chain = prompt | llm_service.get_llm("orchestrator") | parser
+
+    try:
+        result = chain.invoke({"question": state.question})
+        state.sub_questions = [sq.question for sq in result.sub_questions]
+
+        # Store the LLM type for each sub-question
+        for i, sq in enumerate(result.sub_questions):
+            if i < len(state.sub_questions):
+                state.sub_answers.append({
+                    "question": sq.question,
+                    "llm_type": sq.llm_type,
+                    "answer": None,
+                    "node_id": str(uuid.uuid4())
+                })
+    except Exception as e:
+        # Fallback in case of parsing errors
+        st.warning(f"Error generating sub-questions: {str(e)}")
+        # Create a simple fallback question
+        state.sub_questions = [f"Can you explain more about {state.question}?"]
+        state.sub_answers = [{
+            "question": state.sub_questions[0],
+            "llm_type": "reasoning",
+            "answer": None,
+            "node_id": str(uuid.uuid4())
+        }]
+
+    return state
+
+
+def answer_directly(state: QuestionState) -> QuestionState:
+    """Answer a question directly using the appropriate LLM."""
+    llm_service = LLMService()
+    cache_manager = CacheManager()
+
+    # Check cache first
+    cached_answer = cache_manager.find_cached_answer(state.question)
+    if cached_answer:
+        state.answer = cached_answer
+        return state
+
+    # Prepare a prompt that includes depth information
+    context = f"This is a depth {state.depth} question in a decomposition tree."
+    if state.depth > 0:
+        context += " Please be concise but thorough."
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", f"""You are a helpful assistant providing clear, accurate answers.
+        {context}
+        Answer the question directly without unnecessary explanations.
+        Focus on being informative and precise."""),
+        ("human", "{question}")
+    ])
+
+    llm = llm_service.get_llm(state.llm_type)
+    chain = prompt | llm
+
+    try:
+        response = chain.invoke({"question": state.question})
+        state.answer = response.content
+
+        # Add to cache
+        cache_manager.add_to_cache(state.question, state.answer)
+    except Exception as e:
+        state.answer = f"I encountered an error while processing this question: {str(e)}"
+
+    return state
+
+
+def process_sub_questions(state: QuestionState) -> Dict[str, Any]:
+    """Process each sub-question recursively."""
+    # This function prepares the sub-questions for recursive processing
+    # by creating new states for each sub-question
+
+    sub_states = []
+    for sub_answer in state.sub_answers:
+        sub_state = QuestionState(
+            question=sub_answer["question"],
+            depth=state.depth + 1,
+            question_path=state.question_path + [state.question],
+            max_depth=state.max_depth,
+            node_id=sub_answer["node_id"],
+            parent_id=state.node_id,
+            llm_type=sub_answer["llm_type"]
+        )
+        sub_states.append(sub_state)
+
+    return {"sub_states": sub_states}
+
+
+def aggregate_answers(state: QuestionState) -> QuestionState:
+    """Combine answers from sub-questions into a final answer."""
+    llm_service = LLMService()
+
+    # Build context from sub-questions and answers
+    context = "Here are the sub-questions and their answers:\n\n"
+    for sub_answer in state.sub_answers:
+        context += f"Sub-question: {sub_answer['question']}\n"
+        context += f"Answer: {sub_answer['answer']}\n\n"
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert at synthesizing information from multiple sources.
+        Based on the answers to sub-questions, provide a comprehensive answer to the original question.
+        Be concise but thorough, and ensure your answer directly addresses what was asked."""),
+        ("human", """Original question: {question}
+        
+        {context}
+        
+        Please synthesize these answers into a cohesive response to the original question.""")
+    ])
+
+    chain = prompt | llm_service.get_llm("creative")
+
+    try:
+        response = chain.invoke(
+            {"question": state.question, "context": context})
+        state.answer = response.content
+
+        # Add to cache
+        cache_manager = CacheManager()
+        cache_manager.add_to_cache(state.question, state.answer)
+    except Exception as e:
+        state.answer = f"Error synthesizing answers: {str(e)}"
+
+    return state
+
+
+def update_tree_data(state: QuestionState, parent_id: Optional[str] = None) -> Dict:
+    """Update the tree data structure for visualization."""
+    node_data = {
+        "id": state.node_id,
+        "parent_id": parent_id,
+        "question": state.question,
+        "answer": state.answer,
+        "children": []
+    }
+
+    return node_data
+
+
+def route_based_on_decision(state: QuestionState) -> str:
+    """Route to the next step based on the breakdown decision."""
+    if state.decision == "break down":
+        return "generate_sub_questions"
+    else:
+        return "answer_directly"
+
+
+def handle_recursion_result(state: Dict[str, Any]) -> QuestionState:
+    """Handle the results of recursive processing of sub-questions."""
+    original_state = state["original_state"]
+    sub_results = state.get("sub_results", [])
+
+    # Update sub-answers with results from recursive processing
+    if sub_results:
+        for i, result in enumerate(sub_results):
+            if i < len(original_state.sub_answers):
+                original_state.sub_answers[i]["answer"] = result.answer
+
+                # Update tree data
+                if "tree_data" not in original_state.dict():
+                    original_state.tree_data = {}
+
+                if not original_state.tree_data:
+                    original_state.tree_data = update_tree_data(original_state)
+
+                # Add child to tree
+                child_data = update_tree_data(result, original_state.node_id)
+                original_state.tree_data["children"].append(child_data)
+
+    return original_state
+
+
+def build_question_graph():
+    """Build the LangGraph workflow for question decomposition."""
+    # Create the workflow graph
+    workflow = StateGraph(QuestionState)
+
+    # Add nodes to the graph
+    workflow.add_node("should_break_down", should_break_down)
+    workflow.add_node("generate_sub_questions", generate_sub_questions)
+    workflow.add_node("process_sub_questions", process_sub_questions)
+    workflow.add_node("answer_directly", answer_directly)
+    workflow.add_node("aggregate_answers", aggregate_answers)
+    workflow.add_node("handle_recursion_result", handle_recursion_result)
+
+    # Add edges to the graph
+    workflow.add_edge(START, "should_break_down")  # Define the entrypoint
+    workflow.add_conditional_edges(
+        "should_break_down",
+        route_based_on_decision,
+        {
+            "generate_sub_questions": "generate_sub_questions",
+            "answer_directly": "answer_directly"
+        }
+    )
+    workflow.add_edge("generate_sub_questions", "process_sub_questions")
+    workflow.add_conditional_edges(
+        "process_sub_questions",
+        lambda x: "handle_recursion_result" if x.sub_questions else "aggregate_answers",
+        {
+            "handle_recursion_result": "handle_recursion_result",
+            "aggregate_answers": "aggregate_answers"
+        }
+    )
+    workflow.add_edge("handle_recursion_result", "aggregate_answers")
+    workflow.add_edge("answer_directly", END)
+    workflow.add_edge("aggregate_answers", END)
+
+    # Compile the graph
+    return workflow.compile()
+
+
+def process_question(question: str, max_depth: int = 5) -> Tuple[str, Dict]:
+    """Process a question using the LangGraph workflow."""
+    # Initialize cache manager
+    cache_manager = CacheManager()
+
+    # Check cache first
+    cached_answer = cache_manager.find_cached_answer(question)
+    if cached_answer:
+        return cached_answer, {"question": question, "answer": cached_answer, "children": []}
+
+    # Initialize state
+    state = QuestionState(
+        question=question,
+        depth=0,
+        question_path=[],
+        question_hash=cache_manager.get_hash(question),
+        node_id=str(uuid.uuid4()),
+        max_depth=max_depth
+    )
+
+    # Build and run the graph
+    graph = build_question_graph()
+    final_state = graph.invoke(state)
+
+    # Update tree data if not already set
+    if not hasattr(final_state, 'tree_data') or not final_state.tree_data:
+        final_state.tree_data = update_tree_data(final_state)
+
+    return final_state.answer, final_state.tree_data
+
+
+def display_tree(tree, level=0):
+    """Display the question tree in the Streamlit app."""
+    if not tree:
+        return
+
+    if level == 0:
+        st.markdown(f"### Question: {tree.get('question', 'Unknown')}")
+        st.markdown(f"**Answer:** {tree.get('answer', 'No answer')}")
+    else:
+        st.markdown("  " * level +
+                    f"- **Sub-question:** {tree.get('question', 'Unknown')}")
+        st.markdown("  " * level +
+                    f"  *Answer:* {tree.get('answer', 'No answer')}")
+
+    for child in tree.get('children', []):
+        display_tree(child, level + 1)
+
+
+def main():
+    """Main Streamlit application."""
+    st.title("Poly-Chat: Question Decomposition System")
+    st.write(
+        "Enter a complex question and watch it get broken down into simpler sub-questions")
+
+    # Initialize session state
+    if "semantic_cache" not in st.session_state:
+        st.session_state.semantic_cache = []
+
+    # User inputs
+    query = st.text_input(
+        "Query", "What is the impact of quantum computing on cryptography and how should businesses prepare?")
+    max_depth = st.slider("Maximum Recursion Depth",
+                          min_value=1, max_value=10, value=3)
+
+    # Process button
+    if st.button("Submit"):
+        with st.spinner("Processing your question..."):
+            answer, tree = process_question(query, max_depth)
+            st.session_state.question_tree = tree
+            st.session_state.final_answer = answer
+
+    # Display results
+    if "final_answer" in st.session_state:
+        st.markdown("## Final Answer")
+        st.markdown(st.session_state.final_answer)
+
+        st.markdown("## Question Breakdown")
+        display_tree(st.session_state.question_tree)
+
+        # Cache statistics
+        st.markdown("## Cache Statistics")
+        st.write(f"Cache size: {len(st.session_state.semantic_cache)} entries")
+
+
+if __name__ == "__main__":
+    main()
